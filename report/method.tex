@@ -1,0 +1,270 @@
+% SimulacraBench method description -- draft 5 (2026-11-16).
+% Build: bash report/build.sh  (writes _report_build/method.pdf; the author line comes
+% from a file the build script writes outside Git). Until the organisers' template
+% (simulacrabench-template.sty) is in report/, NeurIPS-sized pages stand in for it.
+\documentclass[10pt]{article}
+\IfFileExists{simulacrabench-template.sty}{\usepackage{simulacrabench-template}}{%
+  \usepackage[letterpaper,textwidth=5.5in,textheight=9in,top=1in]{geometry}%
+  \usepackage{newtxtext,newtxmath}}
+\usepackage[T1]{fontenc}
+\usepackage{booktabs}
+\usepackage{amsmath}
+\usepackage{microtype}
+\usepackage[htt]{hyphenat}
+\usepackage[hidelinks]{hyperref}
+\setlength{\emergencystretch}{3em}
+\usepackage{xcolor}
+\usepackage{seqsplit}
+\input{probe-result.tex}   % \ProbeType, \ProbeMeaning, \TabICLUsed -- filled from the probe run
+
+\title{Skip-aware backoff with out-of-fold mixing\\for SimulacraBench}
+\InputIfFileExists{_author.tex}{}{\author{Team junhyun-dev}}
+\date{}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+We complete each held-out respondent's survey from the only answers the grader
+shows for them, the GIVEN block. For every PREDICT item we fit a small set of
+predictors on the visible rows, inside the scoring container, and choose between
+and mix them by out-of-fold log score computed the way the grader computes it.
+The predictors are a hierarchical Dirichlet backoff over the most informative
+GIVEN columns, a gate recursion that carries a parent's predicted answer down a
+skip chain, a multitask network shared by all items of an instrument, per-item
+gradient-boosted trees, and the pretrained TabICLv2 tabular model~\cite{qu2026tabiclv2} used in
+context without fine-tuning. A per-item temperature is chosen last. Hidden rows
+are predicted by tree and TabICL models refitted on every visible row. We use
+no language model, no question text, no external data and no fine-tuning.
+On Development the method scores $0.476$ mean skill ($0$ = crowd marginal,
+$1$ = perfect); versions with and without TabICLv2 fell within one rounding
+step of each other. Because the grader returns no logs, one failing probe
+submission, whose exception type reports only the state of our own code,
+confirmed that TabICLv2 ran on the grader's GPU (Section~5). The final
+Test submission scored $0.483$.
+\end{abstract}
+
+\section{What the task rewards}
+
+Each blank cell is scored by the log of the probability given to the answer
+that was there, after the grader renormalises the vector and mixes it with a
+flat vector at floor $\varepsilon=10^{-3}$; the skill reported is relative to
+the crowd marginal ($0$ = marginal). Two facts of the data shape everything
+that follows.
+
+\begin{enumerate}
+\item \textbf{Only GIVEN can move a prediction.} Hidden respondents show only
+  their GIVEN block (7, 9 and 17 columns for UNICEF, World Bank and UNHCR).
+  Every PREDICT cell of a hidden row is blank, so a respondent's other answers
+  are never available at prediction time.
+\item \textbf{Many items are gated.} When the gate parent is GIVEN, whether the
+  item was asked is known exactly. When the parent is itself PREDICT (155 of the
+  156 gated UNHCR items), whether it was asked is uncertain and chains up to
+  four levels deep. The probability of \texttt{NA\_GATED} must therefore be
+  predicted, not copied.
+\end{enumerate}
+
+\section{Predictors}
+
+\paragraph{Backoff.} For item $j$, with an option list that includes
+\texttt{NA\_GATED} when the item is gated, GIVEN columns are ranked by mutual
+information with the answer on the training fold. Level $0$ is the marginal
+with half a count per option; level $l$ conditions on the first $l$ columns,
+\[
+p_l(\cdot\mid s_l)=\frac{n(s_l,\cdot)+\alpha\,p_{l-1}(\cdot\mid s_{l-1})}{N(s_l)+\alpha},
+\]
+so a stratum never seen keeps its coarser estimate. When the gate parent is
+GIVEN, that column is forced first, so whenever the backoff conditions on at
+least one column a skip the visible answer decides is reproduced up to the
+$\alpha$ smoothing. $\alpha\in\{0.5,2,8,32\}$ and depth $m\in\{0,\dots,4\}$ are
+chosen out of fold.
+
+\paragraph{Gate recursion.} For an item gated on a PREDICT parent,
+$P(\text{asked}\mid x)=\sum_v P_{\text{parent}}(v\mid x)\,g(v)$, where $g(v)$ is
+the share of visible respondents with parent answer $v$ who were asked,
+smoothed by half a pseudo-count toward the declared rule. The answer given asked
+is a backoff fitted on the asked rows. Parents are processed first, so their
+out-of-fold and hidden-row predictions feed their children.
+
+\paragraph{Multitask network.} One network per instrument: one-hot GIVEN input,
+a 256-unit hidden layer with dropout $0.25$ plus a linear path from input to
+logits initialised at zero (so the model contains multinomial logistic
+regression as a special case), and one softmax
+per item over its full option list. Cross-entropy over all observed cells,
+AdamW, early stopping on the held-out fold; three seeds per fold are averaged.
+For an item whose gate parent is GIVEN, the asked/not-asked split is imposed
+on the network, tree and TabICL outputs alike, from the smoothed share of
+visible respondents asked for each parent value.
+
+\paragraph{Gradient-boosted trees.} Per item, scikit-learn~\cite{pedregosa2011sklearn}
+\texttt{HistGradientBoostingClassifier} with the GIVEN columns as categorical
+features (learning rate $0.08$, at most 200 iterations, 15 leaves, early
+stopping on an internal 15\% split).
+
+\paragraph{TabICLv2.} The pretrained in-context tabular classifier~\cite{qu2025tabicl,qu2026tabiclv2}
+(\texttt{jingang/TabICL}, BSD-3; checkpoint
+\texttt{tabicl-classifier-v2-20260212.ckpt}, revision \texttt{4dcd344e}), with no fine-tuning and four estimators. For
+each fold the other folds' rows are the context (at most 20{,}000 rows) and the
+fold's rows are the queries. The checkpoint is pre-downloaded by the runtime
+from \texttt{models.txt}, found in the local cache, and loaded once for all
+items. Adding TabICLv2 followed the public README of
+\texttt{exochard/simulacrabench-v33} (Apache-2.0, read 2026-11-13), which
+describes a similar per-item out-of-fold blend with TabICLv2 and reports the
+same rounded Development scores as our v4; we read only its README and took
+no code from it.
+
+\section{Choosing and mixing, out of fold}
+
+Visible rows are split into three folds once per instrument. For each item:
+\begin{enumerate}
+\item pick the backoff or recursion setting with the best floored out-of-fold
+  log score;
+\item mix in the network with weight $w\in\{0.1,\dots,1.0\}$ if some $w$
+  improves the out-of-fold score; then the trees; then TabICL, each greedily on
+  top of the previous mixture;
+\item choose a temperature $t\in\{0.7,0.8,0.9,1.1,1.25,1.5\}$ for $p^t$
+  (renormalised) if it improves the out-of-fold score.
+\end{enumerate}
+Every comparison uses the grader's own transform (renormalise, floor, log), so a
+component that does not help an item is simply not mixed into it. Hidden rows
+use the same choices. The backoff is refitted on all visible rows; the network
+is averaged over its fold models; the trees and TabICL are refitted once more on
+every visible row (TabICL keeps the fold average if time runs out before that
+last pass).
+
+\section{Runtime}
+
+The README asks that training happen offline, outside the timed
+\texttt{predict()}. The respondent data are never released (FAQ~4), and in the
+Test phase the DEV respondents return as visible rows, ``answers included,
+which is where they are worth most''. Everything that depends on the data is
+therefore computed inside \texttt{predict()} on the visible rows of the frame it
+receives, once per instrument, in one process, as the official crowd-marginal
+baseline does with its counts. Wall-clock guards stop \emph{starting} expensive
+components before the phase budget and fall back to what is already fitted. In
+the final version (3600\,s) the trees stop starting after 2016\,s and TabICL
+after 2160\,s; after 2520\,s the network stops adding seeds and any item not
+yet reached gets the crowd marginal. The Development version used 560\,s,
+600\,s and 700\,s within its 900\,s budget. TabICL runs only
+when a GPU is visible and the checkpoint is found; any exception inside it
+leaves the item with the components already chosen. Package versions are pinned
+(\texttt{tabicl==2.2.0}, \texttt{einops==0.8.2}).
+
+\section{Checking what ran on the grader}
+
+The grader returns no standard output or traceback; for an exception inside
+\texttt{predict()} it returns only the exception's type. Failed submissions do
+not count in either phase. Since a silent fallback (no GPU, checkpoint not
+found, out of time) would leave the score close to the version without TabICL,
+we could not tell from Development scores whether TabICL ever ran. We therefore
+submitted, in the Test phase, a probe identical to the final code that records
+how far TabICL got and, after the last instrument, raises an exception whose
+type encodes it: for example \texttt{ProcessLookupError} for ``checkpoint not
+found'', \texttt{RecursionError} for ``ran but chosen for no item'', and
+\texttt{NotImplementedError} for ``mixed into at least one item, run finished
+within 75\% of the budget''.
+The competition terms forbid exfiltrating records through side channels
+such as deliberately inflated error messages. The probe carried no record:
+the exception type took one of eleven fixed values set only by the state of
+our own code (GPU visible, checkpoint found and imported, how far the TabICL
+fits got, whether out-of-fold selection mixed TabICL into any item, and
+whether the run used less than 75\% of the budget). No respondent value,
+prediction, item name or score was encoded; the exception message, which the
+grader does not return, held only counts of fitted and mixed items and the
+elapsed time. The answer key never enters the container (README, ``What
+happens when you submit'', step~3). The probe ran once.
+\textbf{Result:} the probe returned \texttt{\ProbeType}, i.e.\ \ProbeMeaning.
+
+\section{Results}
+
+Development skill ($0$ = crowd marginal, $1$ = perfect, higher is better).
+Scores are noised and rounded to $0.01$ on the uniform scale before
+conversion, so one step is about $0.0135$, $0.0150$ and $0.0193$ skill on
+UNICEF, World Bank and UNHCR:
+
+\begin{center}\small
+\begin{tabular}{@{}llrrrr@{}}
+\toprule
+Version & What changes & UNICEF & World Bank & UNHCR & Overall\\
+\midrule
+v4 & backoff, recursion, network, trees & 0.3499 & 0.2335 & 0.8457 & 0.4764\\
+v5 & + TabICLv2 & 0.3499 & 0.2335 & 0.8650 & 0.4828\\
+v5 & same ZIP, next day & 0.3499 & 0.2335 & 0.8457 & 0.4764\\
+v6, v7 & TabICL time shared or given to UNHCR & 0.3499 & 0.2335 & 0.8457 & 0.4764\\
+v8 & v5 + refit on all visible rows for hidden rows & 0.3499 & 0.2335 & 0.8457 & 0.4764\\
+\midrule
+Final (Test) & v8 with the 3600\,s budget & 0.3419 & 0.2343 & 0.8734 & 0.4832\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The same v5 ZIP scored $0.8650$ and $0.8457$ on UNHCR on consecutive days, so
+the same code can move one step between runs (Development noise, or a
+different path under the 600\,s TabICL guard), and Development scores could
+not rank v4--v8. We therefore chose the final version by the in-container
+out-of-fold selection itself, which mixes in a component only where it
+improves the out-of-fold score on visible rows (an optimistic estimate, since
+the weights and temperature are chosen on the same folds). v4 (no pretrained
+model) was the fallback ZIP; it was not needed. The Final row is the Test
+leaderboard score of submission 1059398 (held-out respondents, so not directly
+comparable with the Development rows).
+
+\section{What did not go in}
+
+\paragraph{Question wording and language models.} On the World Values Survey,
+``Random Forests demonstrate stronger performance than LLMs when trained with
+sufficient data''~\cite{sinacola2025llms}; on SHARE, ``demographics-only agents
+(1) exhibited a central tendency bias, skewing answers toward population means''~\cite{garzon2026demographics}. With thousands of visible respondents per instrument
+we spent the budget on tabular models instead.
+
+\paragraph{External data.} None.
+
+\section{Limitations}
+
+The backoff and the trees treat every GIVEN column as categorical and do not
+use the order of ordinal answers. The gate recursion assumes the declared
+parent is the only reason an item is skipped. The network and TabICL are not
+tuned per instrument beyond the out-of-fold mixing weights. We cannot say
+which component helps on the real data: Development scores could not
+separate the versions and the grader returns no logs.
+
+\paragraph{Reproducibility.} Code: \url{\CodeURL} (MIT). The submission is
+three files: \texttt{main.py}, \texttt{requirements.txt}
+(\texttt{tabicl==2.2.0}, \texttt{einops==0.8.2}; numpy, pandas, scikit-learn
+and torch come preinstalled in the grader's Python 3.13 image) and \texttt{models.txt}
+(\texttt{jingang/TabICL}; it names a repository, not a revision, and that
+repository's head has been \texttt{4dcd344e} since 2026-02-18). The final ZIP
+has SHA-256 \texttt{\seqsplit{c0e043749d6803bdab4a0a2a0fc09dcc29898ad9ee6984be5cb9007cc07b17a3}}.
+Base model: \TabICLUsed. External data: none. All
+randomness is seeded (seed \texttt{20261112}; fold assignment, network seeds,
+tree and TabICL seeds derive from it). We rerun it locally through the
+organisers' \texttt{score.py} in one Python environment that holds the hosted
+image's packages plus \texttt{requirements.txt}; without a GPU the code skips
+TabICL unless \texttt{SB\_TABICL\_CPU=1} is set. Only the organisers, who hold
+the data, can reproduce the scores by rerunning the ZIP; others can run it end
+to end on the practice data that the organisers' \texttt{make\_sandbox.py}
+generates. Reruns match exactly only if no wall-clock guard fires, and up to
+GPU floating-point non-determinism.
+
+\paragraph{Use of AI tools.} The code and this report were written with an AI
+coding assistant (Claude) under the author's direction; every number in the
+report comes from our own runs or from the cited sources.
+
+\begin{thebibliography}{9}\small
+\bibitem{garzon2026demographics} R.~Garz\'on, P.~Baron, V.~Grari, J.~Kamphorst, et al.
+  From demographics to survey anchors: Evaluating LLM agents for modeling
+  retirement attitudes. arXiv:2605.16303, 2026.
+\bibitem{pedregosa2011sklearn} F.~Pedregosa et al. Scikit-learn: Machine
+  learning in Python. \emph{JMLR}, 12:2825--2830, 2011.
+\bibitem{qu2025tabicl} J.~Qu, D.~Holzm\"uller, G.~Varoquaux, M.~Le~Morvan.
+  TabICL: A tabular foundation model for in-context learning on large data.
+  In \emph{ICML}, 2025. arXiv:2502.05564.
+\bibitem{qu2026tabiclv2} J.~Qu, D.~Holzm\"uller, G.~Varoquaux, M.~Le~Morvan.
+  TabICLv2: A better, faster, scalable, and open tabular foundation model.
+  In \emph{ICML}, 2026. arXiv:2602.11139.
+\bibitem{sinacola2025llms} E.~Sinacola, A.~Pachot, T.~Petit. LLMs, virtual
+  users, and bias: Predicting any survey question without human data.
+  arXiv:2503.16498, 2025.
+\end{thebibliography}
+
+\end{document}
