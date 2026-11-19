@@ -1,4 +1,4 @@
-% SimulacraBench method description -- draft 5 (2026-11-16).
+% SimulacraBench method description -- draft 6 (2026-11-19).
 % Build: bash report/build.sh  (writes _report_build/method.pdf; the author line comes
 % from a file the build script writes outside Git). Until the organisers' template
 % (simulacrabench-template.sty) is in report/, NeurIPS-sized pages stand in for it.
@@ -228,7 +228,8 @@ tuned per instrument beyond the out-of-fold mixing weights. We cannot say
 which component helps on the real data: Development scores could not
 separate the versions and the grader returns no logs.
 
-\paragraph{Reproducibility.} Code: \url{\CodeURL} (MIT). The submission is
+\paragraph{Reproducibility.} Code: \url{\CodeURL} (MIT; the submitted code is
+commit \texttt{f6b2e2002efe}). The submission is
 three files: \texttt{main.py}, \texttt{requirements.txt}
 (\texttt{tabicl==2.2.0}, \texttt{einops==0.8.2}; numpy, pandas, scikit-learn
 and torch come preinstalled in the grader's Python 3.13 image) and \texttt{models.txt}
